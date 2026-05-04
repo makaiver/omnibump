@@ -357,7 +357,15 @@ func resolveAndFilterPackages(ctx context.Context, packages map[string]*Package,
 	log := clog.FromContext(ctx)
 	filtered := make(map[string]*Package)
 
+	mainModule := mainModulePath(modFile)
+
 	for name, pkg := range packages {
+		// Skip the main module — bumping a module as its own dependency is not allowed.
+		if name == mainModule {
+			log.Warnf("Skipping %s: it is the main module of this go.mod and cannot be bumped as a dependency", name)
+			continue
+		}
+
 		resolvedVersion, err := resolvePackageVersion(ctx, name, pkg.Version, modroot)
 		if err != nil {
 			return nil, err
@@ -410,48 +418,118 @@ func resolveAndFilterPackages(ctx context.Context, packages map[string]*Package,
 	return filtered, nil
 }
 
-// checkMissingTransitiveDeps checks all packages being updated for transitive dependency
-// requirements not satisfied by the current go.mod, and logs a warning with co-update
-// recommendations if any are found.
-func checkMissingTransitiveDeps(ctx context.Context, filtered map[string]*Package, modFile *modfile.File) {
+// detectCoUpdates analyzes the requested package updates against the current go.mod
+// and returns the set of additional co-updates required (transitive requirements,
+// version-group siblings) along with API compatibility alerts (mapping each affected
+// package to a recommended minimum compatible version, or empty string when no
+// concrete version could be determined).
+func detectCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) (map[string]MissingDependency, map[string]string) {
 	log := clog.FromContext(ctx)
 
-	// Build set of packages being updated
-	packagesBeingUpdated := make(map[string]string)
-	for name, pkg := range filtered {
-		packagesBeingUpdated[name] = pkg.Version
+	// Snapshot the input so callers can pass the same map without aliasing concerns.
+	packagesBeingUpdated := make(map[string]string, len(packagesToUpdate))
+	for name, ver := range packagesToUpdate {
+		packagesBeingUpdated[name] = ver
 	}
 
-	allMissingDeps := make(map[string]MissingDependency)
-	apiCompatibilityAlerts := make(map[string]struct{})
+	allMissingDeps := make(map[string]MissingDependency, len(packagesToUpdate))
+	apiCompatibilityAlerts := make(map[string]string, len(packagesToUpdate))
 
-	// Create a cache for go.mod files to reduce HTTP requests when checking API compatibility
-	// across multiple packages. This significantly reduces round trips when updating many packages.
+	// Skip the module currently being built — it cannot be bumped as its own dependency.
+	// For example, when analyzing the coredns source directory, github.com/coredns/coredns
+	// is the main module and cannot appear as a co-update recommendation.
+	mainModule := mainModulePath(modFile)
+
+	// Cache go.mod files to reduce HTTP requests across packages.
 	cache := newGoModCache()
 
 	// Pre-fetch all dependencies in one batch to minimize HTTP calls.
 	// For 50 dependencies and 10 package updates: 50 calls total instead of up to 500.
 	preFetchDependencies(ctx, modFile, cache)
 
-	for name, pkg := range filtered {
-		missingDeps, err := CheckTransitiveRequirements(ctx, name, pkg.Version, modFile)
+	for name, version := range packagesToUpdate {
+		// Recommend updating all packages in the same release group (e.g. all otel/*)
+		// to preserve internal API compatibility, including any that have drifted behind.
+		currentVer := getVersion(modFile, name)
+		for _, groupPkg := range FindVersionGroupPackages(name, currentVer, modFile) {
+			if _, alreadyUpdating := packagesBeingUpdated[groupPkg]; alreadyUpdating {
+				continue
+			}
+			if groupPkg == mainModule {
+				log.Infof("Skipping %s as co-update: it is the main module of this go.mod", groupPkg)
+				continue
+			}
+			groupCurrentVer := getVersion(modFile, groupPkg)
+			targetVer := version
+			reason := fmt.Sprintf("version group with %s (both at %s)", name, currentVer)
+			if semver.Major(groupCurrentVer) != semver.Major(version) {
+				// Cross-major family member (e.g. otel/exporters/prometheus on v0.x while
+				// core otel is v1.x). The family root (e.g. go.opentelemetry.io/otel) is
+				// what the exporter requires directly — not otel/sdk specifically.
+				familyRoot := moduleFamilyPrefix(name)
+				targetVer = findMinCompatibleVersion(ctx, groupPkg, groupCurrentVer, familyRoot, version, cache)
+				if targetVer == "" {
+					log.Debugf("No compatible version found for cross-major family member %s (requires %s@%s)", groupPkg, familyRoot, version)
+					continue
+				}
+				reason = fmt.Sprintf("cross-major ecosystem package: %s requires %s@%s", groupPkg, familyRoot, version)
+				log.Infof("Found cross-major co-update: %s@%s", groupPkg, targetVer)
+			}
+			allMissingDeps[groupPkg] = MissingDependency{
+				Package:         groupPkg,
+				RequiredVersion: targetVer,
+				CurrentVersion:  groupCurrentVer,
+				Reason:          reason,
+			}
+		}
+
+		missingDeps, err := CheckTransitiveRequirements(ctx, name, version, modFile)
 		if err != nil {
-			log.Warnf("Could not check transitive requirements for %s@%s: %v", name, pkg.Version, err)
+			log.Warnf("Could not check transitive requirements for %s@%s: %v", name, version, err)
 			continue
 		}
 		collectMissingDeps(ctx, missingDeps, packagesBeingUpdated, allMissingDeps)
 
-		// Also check for API compatibility issues
-		apiIssues, err := CheckAPICompatibilityWithCache(ctx, name, pkg.Version, modFile, cache)
+		// Check for API compatibility issues using the shared cache.
+		apiIssues, err := CheckAPICompatibilityWithCache(ctx, name, version, modFile, cache)
 		if err != nil {
-			log.Debugf("Could not check API compatibility for %s@%s: %v", name, pkg.Version, err)
-		} else {
-			for _, issue := range apiIssues {
-				apiCompatibilityAlerts[issue.Package] = struct{}{}
-				log.Infof("API compatibility alert for %s", issue.Package)
-			}
+			log.Debugf("Could not check API compatibility for %s@%s: %v", name, version, err)
+			continue
+		}
+		for _, issue := range apiIssues {
+			apiCompatibilityAlerts[issue.Package] = issue.RequiredVersion
+			log.Infof("API compatibility alert for %s", issue.Package)
 		}
 	}
+
+	// Remove the main module from any co-updates that slipped through transitive checks.
+	if mainModule != "" {
+		if _, found := allMissingDeps[mainModule]; found {
+			log.Infof("Skipping %s as co-update: it is the main module of this go.mod", mainModule)
+			delete(allMissingDeps, mainModule)
+		}
+	}
+
+	// Second pass: run API compat checks for each discovered co-update.
+	// This catches packages that import a co-updated dep (e.g. otelgrpc importing otel)
+	// and may break when that dep's API changes.
+	runCoUpdateAPICompatChecks(ctx, allMissingDeps, packagesBeingUpdated, modFile, cache, apiCompatibilityAlerts)
+
+	return allMissingDeps, apiCompatibilityAlerts
+}
+
+// checkMissingTransitiveDeps checks all packages being updated for transitive dependency
+// requirements not satisfied by the current go.mod, and logs a warning with co-update
+// recommendations if any are found.
+func checkMissingTransitiveDeps(ctx context.Context, filtered map[string]*Package, modFile *modfile.File) {
+	log := clog.FromContext(ctx)
+
+	packagesToUpdate := make(map[string]string, len(filtered))
+	for name, pkg := range filtered {
+		packagesToUpdate[name] = pkg.Version
+	}
+
+	allMissingDeps, apiCompatibilityAlerts := detectCoUpdates(ctx, packagesToUpdate, modFile)
 
 	if len(allMissingDeps) == 0 && len(apiCompatibilityAlerts) == 0 {
 		return
@@ -497,14 +575,13 @@ func checkMissingTransitiveDeps(ctx context.Context, filtered map[string]*Packag
 		slices.Sort(keys)
 		fmt.Fprintf(&msg, "API COMPATIBILITY ALERTS\n")
 		for _, pkg := range keys {
-			currentVer := ""
-			for _, req := range modFile.Require {
-				if req != nil && req.Mod.Path == pkg {
-					currentVer = req.Mod.Version
-					break
-				}
+			currentVer := getVersion(modFile, pkg)
+			recommendedVer := apiCompatibilityAlerts[pkg]
+			if recommendedVer != "" && recommendedVer != currentVer {
+				fmt.Fprintf(&msg, "  %-*s  %s → >=%s\n", maxLen, pkg, currentVer, recommendedVer)
+			} else {
+				fmt.Fprintf(&msg, "  %-*s  %s (verify manually)\n", maxLen, pkg, currentVer)
 			}
-			fmt.Fprintf(&msg, "  %-*s  %s\n", maxLen, pkg, currentVer)
 		}
 		fmt.Fprintf(&msg, "\n")
 	}
@@ -517,10 +594,45 @@ func checkMissingTransitiveDeps(ctx context.Context, filtered map[string]*Packag
 	log.Warnf("%s", msg.String())
 }
 
+// runCoUpdateAPICompatChecks runs API compatibility checks for each discovered co-update,
+// recording any required minimum versions in apiCompatibilityAlerts. Packages already in
+// packagesBeingUpdated are skipped to avoid redundant checks.
+func runCoUpdateAPICompatChecks(
+	ctx context.Context,
+	allMissingDeps map[string]MissingDependency,
+	packagesBeingUpdated map[string]string,
+	modFile *modfile.File,
+	cache goModCache,
+	apiCompatibilityAlerts map[string]string,
+) {
+	log := clog.FromContext(ctx)
+	for _, dep := range allMissingDeps {
+		if _, isBeingUpdated := packagesBeingUpdated[dep.Package]; isBeingUpdated {
+			continue
+		}
+		apiIssues, err := CheckAPICompatibilityWithCache(ctx, dep.Package, dep.RequiredVersion, modFile, cache)
+		if err != nil {
+			log.Debugf("Could not check API compatibility for co-update %s@%s: %v", dep.Package, dep.RequiredVersion, err)
+			continue
+		}
+		for _, issue := range apiIssues {
+			apiCompatibilityAlerts[issue.Package] = issue.RequiredVersion
+		}
+	}
+}
+
+// mainModulePath returns the module path declared in the go.mod, or empty string if absent.
+func mainModulePath(modFile *modfile.File) string {
+	if modFile.Module != nil {
+		return modFile.Module.Mod.Path
+	}
+	return ""
+}
+
 // buildSuggestedCommand builds the omnibump --packages "..." command string.
 // It merges filtered packages and missing transitive deps, keeping the highest
 // version per module path so each package appears exactly once.
-func buildSuggestedCommand(filtered map[string]*Package, allMissingDeps map[string]MissingDependency, apiAlerts map[string]struct{}, modFile *modfile.File) string {
+func buildSuggestedCommand(filtered map[string]*Package, allMissingDeps map[string]MissingDependency, apiAlerts map[string]string, modFile *modfile.File) string {
 	merged := make(map[string]string, len(filtered)+len(allMissingDeps))
 	for name, pkg := range filtered {
 		merged[name] = pkg.Version
@@ -539,12 +651,14 @@ func buildSuggestedCommand(filtered map[string]*Package, allMissingDeps map[stri
 			merged[dep.Package] = dep.RequiredVersion
 		}
 	}
-	for pkg := range apiAlerts {
+	for pkg, recommendedVer := range apiAlerts {
 		if _, exists := merged[pkg]; !exists {
-			for _, req := range modFile.Require {
-				if req != nil && req.Mod.Path == pkg && req.Mod.Version != "" {
-					merged[pkg] = req.Mod.Version
-					break
+			if semver.IsValid(recommendedVer) {
+				merged[pkg] = recommendedVer
+			} else {
+				// No concrete version found; fall back to current version.
+				if v := getVersion(modFile, pkg); v != "" {
+					merged[pkg] = v
 				}
 			}
 		}

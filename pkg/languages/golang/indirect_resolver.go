@@ -7,7 +7,9 @@ package golang
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"go/types"
 	"io"
 	"net/http"
 	"net/url"
@@ -18,9 +20,17 @@ import (
 	"time"
 
 	"github.com/chainguard-dev/clog"
+	"golang.org/x/exp/apidiff"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
+	"golang.org/x/tools/go/packages"
+)
+
+// Sentinel errors for loadPackageTypes.
+var (
+	errPackageNotFound = errors.New("package not found")
+	errNoTypeInfo      = errors.New("no type information available")
 )
 
 // IndirectResolution contains information about resolving an indirect dependency CVE.
@@ -581,10 +591,14 @@ func CheckTransitiveRequirements(
 		return nil, fmt.Errorf("failed to fetch go.mod for %s@%s: %w", packageName, targetVersion, err)
 	}
 
-	// Build map of current versions in the project
+	// Build map of current versions for packages the project directly depends on.
+	// Indirect deps are excluded: if a package is indirect in the project's go.mod,
+	// the project doesn't import it directly, so API changes in that package cannot
+	// break the project's own code. Go's MVS resolves the appropriate version
+	// automatically from the transitive dependency graph.
 	currentVersions := make(map[string]string)
 	for _, req := range currentModFile.Require {
-		if req != nil {
+		if req != nil && !req.Indirect {
 			currentVersions[req.Mod.Path] = req.Mod.Version
 		}
 	}
@@ -632,6 +646,188 @@ func CheckTransitiveRequirements(
 	}
 
 	return missing, nil
+}
+
+// moduleFamilyPrefix returns the module family prefix used to identify tightly-coupled
+// module ecosystems. For vanity domains (e.g., go.opentelemetry.io/otel/sdk), the family
+// is domain/project (go.opentelemetry.io/otel), grouping all otel sub-modules together.
+// For standard code-hosting domains (github.com, gitlab.com, etc.), the family is the
+// full three-part path (github.com/org/repo), since different repos are unrelated projects.
+func moduleFamilyPrefix(pkg string) string {
+	parts := strings.SplitN(pkg, "/", 4)
+	if len(parts) < 2 {
+		return pkg
+	}
+	domain := parts[0]
+	switch domain {
+	case "github.com", "gitlab.com", "bitbucket.org", "codeberg.org":
+		// Hosting domain: family is domain/org/repo
+		if len(parts) >= 3 {
+			return parts[0] + "/" + parts[1] + "/" + parts[2]
+		}
+	}
+	// Vanity domain: family is domain/project (first path component after domain)
+	return parts[0] + "/" + parts[1]
+}
+
+// FindVersionGroupPackages returns all packages in the project's go.mod that belong to the
+// same module family as packageName and are at or below currentVersion. This covers both
+// the common case (all packages co-released at the same version) and the drift case (a
+// package in the same ecosystem that was left behind at an older version in a prior update).
+//
+// Module family is determined by moduleFamilyPrefix: for example, all
+// go.opentelemetry.io/otel/* packages share the family go.opentelemetry.io/otel and must
+// move together to preserve internal API compatibility.
+func FindVersionGroupPackages(packageName, currentVersion string, modFile *modfile.File) []string {
+	if !semver.IsValid(currentVersion) {
+		return nil
+	}
+	family := moduleFamilyPrefix(packageName)
+	group := make([]string, 0, len(modFile.Require))
+	for _, req := range modFile.Require {
+		if req == nil || req.Mod.Path == packageName {
+			continue
+		}
+		// Only include packages in the same module family.
+		if req.Mod.Path != family && !strings.HasPrefix(req.Mod.Path, family+"/") {
+			continue
+		}
+		// Include packages at or below the current version: same release or drifted behind.
+		if semver.IsValid(req.Mod.Version) && semver.Compare(req.Mod.Version, currentVersion) <= 0 {
+			group = append(group, req.Mod.Path)
+		}
+	}
+	return group
+}
+
+// findMinCompatibleVersion returns the lowest version of depPkg (above depVer) whose go.mod
+// requires importedPkg at >= minVersion. This identifies the minimum version of a package
+// that is compatible with a dependency upgrade — e.g., the lowest go-ldap that requires
+// go-ntlmssp@v0.1.1 after ntlmssp's ProcessChallenge signature changed.
+//
+// Returns empty string if no compatible version is found within the version limit.
+func findMinCompatibleVersion(ctx context.Context, depPkg, depVer, importedPkg, minVersion string, cache goModCache) string {
+	versions, err := fetchAvailableVersions(ctx, depPkg)
+	if err != nil {
+		return ""
+	}
+
+	// Collect versions strictly above the current one, then sort ascending
+	// so we find the minimum compatible version rather than the latest.
+	candidates := make([]string, 0, len(versions))
+	for _, v := range versions {
+		if semver.IsValid(v) && semver.Compare(v, depVer) > 0 {
+			candidates = append(candidates, v)
+		}
+	}
+	semver.Sort(candidates)
+
+	// Cap to avoid excessive HTTP calls for packages with many releases.
+	const maxCandidates = 30
+	if len(candidates) > maxCandidates {
+		candidates = candidates[:maxCandidates]
+	}
+
+	for _, v := range candidates {
+		var mod *modfile.File
+		if cached, ok := cache.get(depPkg, v); ok {
+			mod = cached
+		} else {
+			mod, err = fetchGoModForPackage(ctx, depPkg, v)
+			if err != nil {
+				continue
+			}
+			cache.set(depPkg, v, mod)
+		}
+		for _, req := range mod.Require {
+			if req == nil || req.Indirect || req.Mod.Path != importedPkg {
+				continue
+			}
+			if semver.IsValid(req.Mod.Version) && semver.Compare(req.Mod.Version, minVersion) >= 0 {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// CheckAPIBreakingChanges compares the exported API of packageName between oldVersion and
+// newVersion using apidiff. Returns the list of incompatible (breaking) changes, or nil if
+// the APIs are compatible or the comparison cannot be completed.
+//
+// Use this to distinguish genuine API incompatibilities (e.g. a changed function signature)
+// from false-positive compat alerts where the dependency simply added new symbols.
+func CheckAPIBreakingChanges(ctx context.Context, packageName, oldVersion, newVersion string) ([]string, error) {
+	log := clog.FromContext(ctx)
+
+	oldTypes, err := loadPackageTypes(ctx, packageName, oldVersion)
+	if err != nil {
+		return nil, fmt.Errorf("loading %s@%s: %w", packageName, oldVersion, err)
+	}
+
+	newTypes, err := loadPackageTypes(ctx, packageName, newVersion)
+	if err != nil {
+		// The new version failed to load. This means either:
+		// - the package was removed from the module (e.g. loki/v3/pkg/storage/wal)
+		// - the new version is internally broken (e.g. references an undefined symbol)
+		// Both are breaking changes from the consumer's perspective.
+		log.Warnf("Package %s unavailable in %s (removed or internally broken): %v", packageName, newVersion, err)
+		return []string{fmt.Sprintf("package %s is unavailable in %s — it may have been removed or contains internal errors", packageName, newVersion)}, nil
+	}
+
+	report := apidiff.Changes(oldTypes, newTypes)
+
+	var breaking []string
+	for _, change := range report.Changes {
+		if !change.Compatible {
+			log.Infof("Breaking change in %s %s→%s: %s", packageName, oldVersion, newVersion, change.Message)
+			breaking = append(breaking, change.Message)
+		}
+	}
+	return breaking, nil
+}
+
+// loadPackageTypes creates a temporary module, resolves packageName@version, and returns
+// the type-checked *types.Package for use with apidiff.
+func loadPackageTypes(ctx context.Context, packageName, version string) (*types.Package, error) {
+	tmpDir, err := os.MkdirTemp("", "omnibump-apidiff-*")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	goModContent := fmt.Sprintf("module apidiff_temp\n\ngo 1.21\n\nrequire %s %s\n", packageName, version)
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(goModContent), 0o600); err != nil {
+		return nil, err
+	}
+	// A valid .go file is required for packages.Load to initialise the module.
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		return nil, err
+	}
+
+	cfg := &packages.Config{
+		Mode:    packages.NeedTypes | packages.NeedSyntax | packages.NeedImports | packages.NeedDeps,
+		Dir:     tmpDir,
+		Context: ctx,
+		// GONOSUMCHECK=* disables checksum verification because this is a throwaway
+		// temp module used only for type analysis, not a production build artifact.
+		Env: append(os.Environ(), "GOFLAGS=-mod=mod", "GONOSUMCHECK=*"),
+	}
+
+	pkgs, err := packages.Load(cfg, packageName)
+	if err != nil {
+		return nil, err
+	}
+	if len(pkgs) == 0 {
+		return nil, fmt.Errorf("%s@%s: %w", packageName, version, errPackageNotFound)
+	}
+	if pkgs[0].Types == nil {
+		if len(pkgs[0].Errors) > 0 {
+			return nil, fmt.Errorf("loading package: %w", pkgs[0].Errors[0])
+		}
+		return nil, fmt.Errorf("%s@%s: %w", packageName, version, errNoTypeInfo)
+	}
+	return pkgs[0].Types, nil
 }
 
 // CheckAPICompatibilityWithCache checks API compatibility using a shared cache to reduce HTTP requests.
@@ -685,10 +881,16 @@ func CheckAPICompatibilityWithCache(
 		for _, depReq := range depModFile.Require {
 			if depReq != nil && depReq.Mod.Path == packageName {
 				// This dependency imports the package being updated.
-				// Flag it as potentially needing an update due to API/schema changes.
+				// Try to find the minimum version of depPkg that is compatible with
+				// the new targetVersion, so we can recommend a concrete upgrade path.
+				recommendedVer := findMinCompatibleVersion(ctx, depPkg, depVer, packageName, targetVersion, cache)
+				if recommendedVer == "" {
+					// No compatible version found within the search limit; keep current.
+					recommendedVer = depVer
+				}
 				potentialIssues = append(potentialIssues, MissingDependency{
 					Package:         depPkg,
-					RequiredVersion: depVer, // Keep current version as suggestion; user should verify
+					RequiredVersion: recommendedVer,
 					CurrentVersion:  depVer,
 					Reason:          fmt.Sprintf("%s imports %s which is being updated to %s (potential API/schema incompatibility — may need manual verification and version bump)", depPkg, packageName, targetVersion),
 				})

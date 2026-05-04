@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/chainguard-dev/clog"
 	"github.com/chainguard-dev/omnibump/pkg/analyzer"
@@ -377,7 +378,23 @@ func (ga *GolangAnalyzer) RecommendStrategy(ctx context.Context, analysis *analy
 		AffectedDependencies: make(map[string][]string),
 	}
 
+	// Parse go.mod once here and pass it to checkTransitiveRequirementsForStrategy
+	// to avoid a second disk read for the same file.
+	var strategyModFile *modfile.File
+	mainModule := ""
+	if rootPath, ok := analysis.Metadata["moduleRoot"].(string); ok {
+		if mf, _, err := ParseGoModfile(filepath.Join(rootPath, "go.mod")); err == nil {
+			strategyModFile = mf
+			mainModule = mainModulePath(mf)
+		}
+	}
+
 	for _, dep := range deps {
+		if dep.Name == mainModule {
+			log.Warnf("Skipping %s: it is the main module of this go.mod and cannot be bumped as a dependency", dep.Name)
+			continue
+		}
+
 		if depInfo, exists := analysis.Dependencies[dep.Name]; exists {
 			// Check if this is a replaced dependency
 			if replaced, ok := depInfo.Metadata["replaced"].(bool); ok && replaced {
@@ -399,8 +416,9 @@ func (ga *GolangAnalyzer) RecommendStrategy(ctx context.Context, analysis *analy
 		log.Debugf("Will update %s to %s", dep.Name, dep.Version)
 	}
 
-	// Check transitive requirements for all packages being updated
-	ga.checkTransitiveRequirementsForStrategy(ctx, analysis, strategy)
+	// Check transitive requirements for all packages being updated.
+	// Pass the already-parsed modFile to avoid a redundant disk read.
+	ga.checkTransitiveRequirementsForStrategy(ctx, analysis, strategy, strategyModFile)
 
 	// Deduplicate DirectUpdates — the same package can be added from multiple paths
 	// (direct update, parent bump for an indirect dep, transitive co-update).
@@ -417,86 +435,36 @@ func (ga *GolangAnalyzer) checkTransitiveRequirementsForStrategy(
 	ctx context.Context,
 	analysis *analyzer.AnalysisResult,
 	strategy *analyzer.Strategy,
+	modFile *modfile.File,
 ) {
 	log := clog.FromContext(ctx)
 
-	// Get module root from analysis
-	modRoot := "."
-	if rootPath, ok := analysis.Metadata["moduleRoot"].(string); ok {
-		modRoot = rootPath
-	}
-
-	// Parse go.mod (if moduleRoot is set and file exists)
-	modFilePath := filepath.Join(modRoot, "go.mod")
-	modFile, _, err := ParseGoModfile(modFilePath)
-	if err != nil {
-		// If we can't parse go.mod, skip transitive checking
-		// This can happen in tests or when analyzing remotely
-		log.Debugf("Could not parse go.mod for transitive checking: %v", err)
-		return
-	}
-
-	// Build map of packages being updated
-	packagesBeingUpdated := make(map[string]string)
-	for _, dep := range strategy.DirectUpdates {
-		packagesBeingUpdated[dep.Name] = dep.Version
-	}
-
-	// Check each package for missing transitive requirements
-	allMissingDeps := make(map[string]MissingDependency)
-
-	for _, dep := range strategy.DirectUpdates {
-		missingDeps, err := CheckTransitiveRequirements(ctx, dep.Name, dep.Version, modFile)
+	// Caller may pass nil if go.mod could not be parsed (e.g. remote analysis without checkout).
+	if modFile == nil {
+		// Fall back to parsing go.mod ourselves if caller couldn't provide it.
+		modRoot := "."
+		if rootPath, ok := analysis.Metadata["moduleRoot"].(string); ok {
+			modRoot = rootPath
+		}
+		var err error
+		modFile, _, err = ParseGoModfile(filepath.Join(modRoot, "go.mod"))
 		if err != nil {
-			log.Warnf("Could not check transitive requirements for %s@%s: %v", dep.Name, dep.Version, err)
-			continue
-		}
-
-		// Also check for potential API/schema incompatibilities in other packages
-		apiIssues, err := CheckAPICompatibility(ctx, dep.Name, dep.Version, modFile)
-		if err != nil {
-			log.Debugf("Could not check API compatibility for %s@%s: %v", dep.Name, dep.Version, err)
-		} else if len(apiIssues) > 0 {
-			// Collect API compatibility issues for grouped warning
-			for _, issue := range apiIssues {
-				strategy.Warnings = append(strategy.Warnings,
-					fmt.Sprintf("API Compatibility Alert - %s imports %s which is being updated to %s (may require manual version bump)",
-						issue.Package, dep.Name, dep.Version))
-				log.Infof("API compatibility alert for %s", issue.Package)
-			}
-		}
-
-		// Only add missing deps that are NOT already being updated
-		for _, missing := range missingDeps {
-			// Skip if this dependency is already in the update list
-			if targetVer, beingUpdated := packagesBeingUpdated[missing.Package]; beingUpdated {
-				// Check if the version being updated is sufficient
-				if semver.IsValid(targetVer) && semver.IsValid(missing.RequiredVersion) {
-					if semver.Compare(targetVer, missing.RequiredVersion) >= 0 {
-						log.Debugf("Dependency %s requirement satisfied by update to %s", missing.Package, targetVer)
-						continue
-					}
-				}
-			}
-
-			// Add to missing deps (deduplicate, keep highest required version)
-			if existing, exists := allMissingDeps[missing.Package]; exists {
-				if semver.IsValid(missing.RequiredVersion) && semver.IsValid(existing.RequiredVersion) {
-					if semver.Compare(missing.RequiredVersion, existing.RequiredVersion) > 0 {
-						allMissingDeps[missing.Package] = missing
-					}
-				}
-			} else {
-				allMissingDeps[missing.Package] = missing
-			}
+			log.Debugf("Could not parse go.mod for transitive checking: %v", err)
+			return
 		}
 	}
 
-	// Add missing dependencies to DirectUpdates, skipping no-ops (where version isn't changing)
+	packagesToUpdate := make(map[string]string, len(strategy.DirectUpdates))
+	for _, dep := range strategy.DirectUpdates {
+		packagesToUpdate[dep.Name] = dep.Version
+	}
+
+	allMissingDeps, apiCompatibilityAlerts := detectCoUpdates(ctx, packagesToUpdate, modFile)
+
+	// Add missing dependencies to DirectUpdates, skipping no-ops (where version isn't changing).
 	if len(allMissingDeps) > 0 {
 		log.Infof("Found %d additional dependencies that need co-updating", len(allMissingDeps))
 		for _, missing := range allMissingDeps {
-			// Skip no-op updates (where required version equals current version)
 			if missing.CurrentVersion == missing.RequiredVersion {
 				log.Debugf("Skipping no-op update for %s (already at %s)", missing.Package, missing.CurrentVersion)
 				continue
@@ -515,6 +483,60 @@ func (ga *GolangAnalyzer) checkTransitiveRequirementsForStrategy(
 			log.Infof("Adding co-update: %s@%s", missing.Package, missing.RequiredVersion)
 		}
 	}
+
+	// Surface API compatibility alerts. When detectCoUpdates determined a minimum
+	// compatible version, add it as a DirectUpdate so it appears in all output types
+	// (JSON, YAML, deps file). A warning is also emitted for human-readable context.
+	// When no version could be determined, emit a warning only.
+	for pkg, recommendedVer := range apiCompatibilityAlerts {
+		// Skip packages that are already being updated — they're handled by DirectUpdates.
+		if _, alreadyUpdating := packagesToUpdate[pkg]; alreadyUpdating {
+			continue
+		}
+		currentVer := getVersion(modFile, pkg)
+		importingPkg, importingVer := findImporterForAlert(pkg, packagesToUpdate, modFile)
+		if recommendedVer != "" && recommendedVer != currentVer {
+			strategy.DirectUpdates = append(strategy.DirectUpdates, analyzer.Dependency{
+				Name:    pkg,
+				Version: recommendedVer,
+				Metadata: map[string]any{
+					"required_by": "api compatibility check",
+					"reason":      fmt.Sprintf("imports %s@%s which has breaking API changes", importingPkg, importingVer),
+				},
+			})
+			log.Infof("Adding API compat co-update: %s@%s (imports %s)", pkg, recommendedVer, importingPkg)
+			strategy.Warnings = append(strategy.Warnings,
+				fmt.Sprintf("API Compatibility Alert - updating %s to %s (imports %s@%s with breaking changes)",
+					pkg, recommendedVer, importingPkg, importingVer))
+			continue
+		}
+		strategy.Warnings = append(strategy.Warnings,
+			fmt.Sprintf("API Compatibility Alert - %s imports %s which is being updated to %s (may require manual version bump)",
+				pkg, importingPkg, importingVer))
+	}
+}
+
+// findImporterForAlert returns a representative (package, version) being updated
+// that triggered the API compatibility alert for the given affected package.
+// Falls back to ("", "") when no concrete importer can be determined; in that case
+// callers should still emit the alert because the affected package is the most
+// actionable signal for the user.
+func findImporterForAlert(affectedPkg string, packagesToUpdate map[string]string, modFile *modfile.File) (string, string) {
+	// Prefer a deterministic choice: walk packagesToUpdate in sorted order.
+	names := make([]string, 0, len(packagesToUpdate))
+	for name := range packagesToUpdate {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		// affectedPkg shouldn't be the importer itself.
+		if name == affectedPkg {
+			continue
+		}
+		return name, packagesToUpdate[name]
+	}
+	// Last resort: report the affected package's current version, with empty importer.
+	return affectedPkg, getVersion(modFile, affectedPkg)
 }
 
 // handleIndirectDependency resolves an indirect dependency to parent bumps.

@@ -1564,6 +1564,77 @@ require (
 	require.NoError(t, err)
 }
 
+// TestDetectCoUpdates_CrossMajorVersionGroup is a regression test for the scenario
+// where an otel exporter package (v0.x cadence) shares the go.opentelemetry.io/otel family
+// with core otel (v1.x cadence). detectCoUpdates must NOT recommend the exporter at the
+// core otel target version (e.g. v1.43.0) — instead it must actively find the correct
+// v0.x version via findMinCompatibleVersion within the version group loop.
+//
+// Failure mode before fix: otlploghttp@v1.43.0 (non-existent) would be recommended.
+// Correct behaviour: otlploghttp@v0.19.0 appears in allMissingDeps (not just apiAlerts).
+func TestDetectCoUpdates_CrossMajorVersionGroup(t *testing.T) {
+	ctx := t.Context()
+
+	// Project has otel core at v1.40.0 and the otlploghttp exporter at v0.18.0.
+	// Both are in the go.opentelemetry.io/otel module family, but otlploghttp uses
+	// a v0.x version cadence while the core packages use v1.x.
+	modContent := `module github.com/example/test
+
+go 1.24
+
+require (
+	go.opentelemetry.io/otel v1.40.0
+	go.opentelemetry.io/otel/sdk v1.40.0
+	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.18.0
+)
+`
+	modFile, err := modfile.Parse("go.mod", []byte(modContent), nil)
+	require.NoError(t, err)
+
+	allMissingDeps, _ := detectCoUpdates(ctx, map[string]string{
+		"go.opentelemetry.io/otel/sdk": "v1.43.0",
+	}, modFile)
+
+	const otlploghttp = "go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
+
+	// The wrong version must never appear — v1.43.0 of otlploghttp does not exist.
+	dep, found := allMissingDeps[otlploghttp]
+	require.True(t, found, "otlploghttp should appear in allMissingDeps")
+	require.NotEqual(t, "v1.43.0", dep.RequiredVersion,
+		"otlploghttp must not be recommended at v1.43.0 — it uses v0.x versioning")
+
+	// The correct version must be found proactively via findMinCompatibleVersion.
+	// otlploghttp@v0.19.0 is the first release that requires otel@v1.43.0.
+	require.Equal(t, "v0.19.0", dep.RequiredVersion,
+		"otlploghttp should be recommended at v0.19.0 via findMinCompatibleVersion")
+}
+
+func TestResolveAndFilterPackages_SkipsMainModule(t *testing.T) {
+	// When the bump step runs inside the coredns source directory, the bot may include
+	// github.com/coredns/coredns itself in the package list (to update the pinned version).
+	// resolveAndFilterPackages must skip it to prevent gobump from failing with
+	// "bumping the main module is not allowed".
+	//
+	// testdata/hello has module = github.com/puerco/hello.
+	ctx := t.Context()
+	modFile, _, err := ParseGoModfile("testdata/hello/go.mod")
+	require.NoError(t, err)
+	require.Equal(t, "github.com/puerco/hello", modFile.Module.Mod.Path)
+
+	packages := map[string]*Package{
+		// The main module — should be silently skipped.
+		"github.com/puerco/hello": {Name: "github.com/puerco/hello", Version: "v1.9.0"},
+		// A normal dep — should pass through.
+		"github.com/sirupsen/logrus": {Name: "github.com/sirupsen/logrus", Version: "v1.9.0"},
+	}
+
+	filtered, err := resolveAndFilterPackages(ctx, packages, modFile, "testdata/hello")
+	require.NoError(t, err)
+
+	require.NotContains(t, filtered, "github.com/puerco/hello",
+		"main module must not appear in filtered packages")
+}
+
 func minimalModFile(t *testing.T) *modfile.File {
 	t.Helper()
 	f, err := modfile.Parse("go.mod", []byte("module example.com/test\n\ngo 1.21\n"), nil)
@@ -1695,8 +1766,8 @@ func TestBuildSuggestedCommand_NonSemverFilteredReplacedBySemverRequirement(t *t
 func TestBuildSuggestedCommand_APIAlertPackageNotInGoMod(t *testing.T) {
 	// A package in apiAlerts that isn't present in go.mod should be silently
 	// skipped rather than emitting a "pkg@" line with an empty version.
-	apiAlerts := map[string]struct{}{
-		"github.com/missing/pkg": {},
+	apiAlerts := map[string]string{
+		"github.com/missing/pkg": "",
 	}
 
 	out := buildSuggestedCommand(nil, nil, apiAlerts, minimalModFile(t))
