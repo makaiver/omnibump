@@ -371,10 +371,12 @@ func checkModFileForIndirectDep(
 }
 
 // goProxyBase is the base URL for the Go module proxy.
-const (
-	goProxyBase = "https://proxy.golang.org"
-	proxyHost   = "proxy.golang.org"
-)
+const goProxyBase = "https://proxy.golang.org"
+
+// proxyHost is the hostname used for all module proxy requests.
+// It is a variable rather than a constant so tests can redirect requests
+// to a local httptest server.
+var proxyHost = "proxy.golang.org"
 
 // proxyClient is used for all Go module proxy requests with a reasonable timeout.
 var proxyClient = &http.Client{Timeout: 30 * time.Second}
@@ -447,7 +449,7 @@ func (c goModCache) has(pkg, ver string) bool {
 // path must begin with "/" and is appended to goProxyBase.
 func fetchFromProxy(ctx context.Context, path string) ([]byte, error) {
 	// Parse the path to validate it before use; only .Path is taken so the
-	// host component of the final request always comes from the proxyHost constant.
+	// host component of the final request always comes from the proxyHost variable.
 	parsedPath, err := url.Parse(path)
 	if err != nil {
 		return nil, fmt.Errorf("invalid proxy path: %w", err)
@@ -660,13 +662,18 @@ func moduleFamilyPrefix(pkg string) string {
 	}
 	domain := parts[0]
 	switch domain {
-	case "github.com", "gitlab.com", "bitbucket.org", "codeberg.org":
-		// Hosting domain: family is domain/org/repo
+	case "github.com", "gitlab.com", "bitbucket.org", "codeberg.org",
+		// golang.org and gopkg.in host many independent projects under a shared
+		// path prefix (e.g. golang.org/x/net vs golang.org/x/oauth2 release
+		// independently). Treat them like hosting domains so each project gets
+		// its own family prefix rather than being grouped under domain/x.
+		"golang.org", "gopkg.in":
+		// Family is domain/org/repo (or domain/prefix/project for vanity domains).
 		if len(parts) >= 3 {
 			return parts[0] + "/" + parts[1] + "/" + parts[2]
 		}
 	}
-	// Vanity domain: family is domain/project (first path component after domain)
+	// Vanity domain: family is domain/project (first path component after domain).
 	return parts[0] + "/" + parts[1]
 }
 
