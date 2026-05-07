@@ -9,11 +9,14 @@ package maven
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/chainguard-dev/clog"
 	"github.com/chainguard-dev/omnibump/pkg/analyzer"
@@ -42,27 +45,68 @@ var (
 
 	// ErrMissingRequiredFields is returned when a dependency is missing groupId or artifactId.
 	ErrMissingRequiredFields = errors.New("missing required fields for dependency")
+
+	// ErrNotMavenPOM is returned when a file is not a valid Maven POM.
+	ErrNotMavenPOM = errors.New("file is not a valid Maven POM")
 )
+
+// DefaultManifestFile is the conventional Maven POM filename.
+const DefaultManifestFile = "pom.xml"
 
 // Maven implements the BuildTool interface for Maven projects.
 type Maven struct{}
+
+// mavenXMLNamespacePrefix is the namespace prefix that identifies a Maven POM root element.
+// Using a prefix rather than an exact version allows detection of future POM model versions
+// (e.g. 4.1.0) without code changes.
+const mavenXMLNamespacePrefix = "http://maven.apache.org/POM/"
+
+// IsMavenPom reports whether path is a Maven POM by parsing the XML and checking
+// that the root element is <project> with the Maven namespace.
+// Returns an error if the file cannot be opened or is not valid XML.
+func IsMavenPom(path string) (bool, error) {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return false, fmt.Errorf("cannot open manifest file %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	decoder := xml.NewDecoder(f)
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("cannot parse manifest file %q: %w", path, err)
+		}
+		if se, ok := token.(xml.StartElement); ok {
+			return se.Name.Local == "project" && strings.HasPrefix(se.Name.Space, mavenXMLNamespacePrefix), nil
+		}
+	}
+}
 
 // Name returns the build tool identifier.
 func (m *Maven) Name() string {
 	return "maven"
 }
 
-// Detect checks if Maven manifest files exist in the directory.
+// Detect checks if a Maven project is present in the directory by looking for
+// pom.xml and validating it is a genuine Maven POM by content.
 func (m *Maven) Detect(ctx context.Context, dir string) (bool, error) {
 	log := clog.FromContext(ctx)
-	pomPath := filepath.Join(dir, "pom.xml")
-	_, err := os.Stat(pomPath)
-	if err == nil {
-		log.Debugf("Detected Maven project at %s", dir)
-		return true, nil
+	pomPath := filepath.Join(dir, DefaultManifestFile)
+	ok, err := IsMavenPom(pomPath)
+	if err != nil {
+		log.Debugf("No Maven project detected at %s: %v", dir, err)
+		return false, nil
 	}
-	log.Debugf("No Maven project detected at %s", dir)
-	return false, nil
+	if !ok {
+		log.Debugf("No Maven project detected at %s", dir)
+		return false, nil
+	}
+	log.Debugf("Detected Maven project at %s", dir)
+	return true, nil
 }
 
 // GetManifestFiles returns Maven manifest files.

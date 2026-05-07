@@ -20,8 +20,9 @@ import (
 	"github.com/chainguard-dev/omnibump/pkg/languages"
 	_ "github.com/chainguard-dev/omnibump/pkg/languages/golang" // Register Go
 	_ "github.com/chainguard-dev/omnibump/pkg/languages/java"   // Register Java (Maven, Gradle, etc.)
-	_ "github.com/chainguard-dev/omnibump/pkg/languages/php"    // Register PHP (Composer, etc.)
-	_ "github.com/chainguard-dev/omnibump/pkg/languages/rust"   // Register Rust
+	"github.com/chainguard-dev/omnibump/pkg/languages/java/maven"
+	_ "github.com/chainguard-dev/omnibump/pkg/languages/php"  // Register PHP (Composer, etc.)
+	_ "github.com/chainguard-dev/omnibump/pkg/languages/rust" // Register Rust
 	charmlog "github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/release-utils/version"
@@ -297,6 +298,19 @@ func runUpdate(cmd *cobra.Command, _ []string) error { // args unused but requir
 	if detectedLang == languageMaven {
 		log.Warnf("Language 'maven' is deprecated, use 'java' instead")
 		detectedLang = languageJava
+	}
+
+	// When --manifest is set, detect language from the file content directly.
+	if flags.manifestFile != "" && (detectedLang == languageAuto || detectedLang == "") {
+		ok, err := maven.IsMavenPom(flags.manifestFile)
+		if err != nil {
+			return fmt.Errorf("failed to read manifest file: %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("--manifest %q: %w", flags.manifestFile, maven.ErrNotMavenPOM)
+		}
+		detectedLang = languageJava
+		log.Infof("Detected language: %s", detectedLang)
 	}
 
 	if detectedLang == languageAuto || detectedLang == "" {
