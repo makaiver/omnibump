@@ -1448,7 +1448,10 @@ func TestMaven_Update_AllowsUpgrade(t *testing.T) {
 	if err := m.Update(context.Background(), cfg); err != nil {
 		t.Fatalf("Update() error: %v", err)
 	}
-	project, _ := ParsePom(filepath.Join(tmpDir, "pom.xml"))
+	project, err := ParsePom(filepath.Join(tmpDir, "pom.xml"))
+	if err != nil {
+		t.Fatalf("ParsePom() error: %v", err)
+	}
 	for _, dep := range *project.Dependencies {
 		if dep.GroupID == "io.netty" && dep.ArtifactID == "netty-codec-http" {
 			if dep.Version != "4.1.133.Final" {
