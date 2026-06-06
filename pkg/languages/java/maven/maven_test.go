@@ -150,7 +150,7 @@ func TestPatchesFromPomFiles(t *testing.T) {
 		name:     "cloudwatch-exporter - dependency patch - existing",
 		in:       "cloudwatch-exporter.pom.xml",
 		patches:  []Patch{{GroupID: "org.eclipse.jetty", ArtifactID: "jetty-servlet", Version: "11.0.16"}},
-		wantDeps: []Patch{{GroupID: "org.eclipse.jetty", ArtifactID: "jetty-servlet", Version: "11.0.16"}},
+		wantDeps: []Patch{{GroupID: "org.eclipse.jetty", ArtifactID: "jetty-servlet", Version: "11.0.18"}},
 	}, {
 		// This patches existing dependency in a project
 		name:       "common-docker - nil DependencyManagement",
@@ -1292,6 +1292,172 @@ func TestMaven_Update_DirectDependencyVersionConflictErrors(t *testing.T) {
 	if !strings.Contains(err.Error(), "com.example:library") {
 		t.Fatalf("Maven.Update() error = %q, want to mention com.example:library", err)
 	}
+}
+
+func TestMavenVersionIsNewer(t *testing.T) {
+	tests := []struct {
+		current   string
+		requested string
+		want      bool
+	}{
+		{"1.84", "1.78", true},
+		{"1.78", "1.84", false},
+		{"2.21.2", "2.21.0", true},
+		{"2.21.0", "2.21.2", false},
+		{"4.1.133.Final", "4.1.110.Final", true},
+		{"4.1.110.Final", "4.1.133.Final", false},
+		{"4.1.133.Final", "4.1.133.Final", false},
+		{"1.84", "1.84", false},
+		{"13.2.1.jre11", "13.2.0.jre11", true},
+		{"13.2.0.jre11", "13.2.1.jre11", false},
+		{"4.1.133.Final", "4.1.133", false},
+		{"2.0.16.RELEASE", "2.0.13.RELEASE", true},
+		{"2.0.16.GA", "2.0.13.GA", true},
+		{"4.1.134-SNAPSHOT", "4.1.133.Final", true},
+		{"", "1.0.0", false},
+		{"1.0.0", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.current+"_vs_"+tt.requested, func(t *testing.T) {
+			got := mavenVersionIsNewer(tt.current, tt.requested)
+			if got != tt.want {
+				t.Errorf("mavenVersionIsNewer(%q, %q) = %v, want %v",
+					tt.current, tt.requested, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMaven_Update_SkipsDowngrade(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeFile(t, filepath.Join(tmpDir, "pom.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>test-project</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-codec-http</artifactId>
+      <version>4.1.133.Final</version>
+    </dependency>
+  </dependencies>
+</project>`)
+	m := &Maven{}
+	cfg := &languages.UpdateConfig{
+		RootDir: tmpDir,
+		Dependencies: []languages.Dependency{
+			{
+				Name:    "io.netty:netty-codec-http",
+				Version: "4.1.110.Final",
+				Metadata: map[string]any{
+					"groupId":    "io.netty",
+					"artifactId": "netty-codec-http",
+				},
+			},
+		},
+	}
+	if err := m.Update(context.Background(), cfg); err != nil {
+		t.Fatalf("Update() unexpected error: %v", err)
+	}
+	project, err := ParsePom(filepath.Join(tmpDir, "pom.xml"))
+	if err != nil {
+		t.Fatalf("ParsePom() error: %v", err)
+	}
+	for _, dep := range *project.Dependencies {
+		if dep.GroupID == "io.netty" && dep.ArtifactID == "netty-codec-http" {
+			if dep.Version != "4.1.133.Final" {
+				t.Errorf("version = %q, want 4.1.133.Final (downgrade must be skipped)", dep.Version)
+			}
+			return
+		}
+	}
+	t.Error("dependency not found in updated POM")
+}
+
+func TestMaven_Update_SkipsPropertyDowngrade(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeFile(t, filepath.Join(tmpDir, "pom.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>test-project</artifactId>
+  <version>1.0.0</version>
+  <properties>
+    <netty.version>4.1.133.Final</netty.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-codec-http</artifactId>
+      <version>${netty.version}</version>
+    </dependency>
+  </dependencies>
+</project>`)
+	m := &Maven{}
+	cfg := &languages.UpdateConfig{
+		RootDir: tmpDir,
+		Properties: map[string]string{
+			"netty.version": "4.1.110.Final",
+		},
+	}
+	if err := m.Update(context.Background(), cfg); err != nil {
+		t.Fatalf("Update() unexpected error: %v", err)
+	}
+	project, err := ParsePom(filepath.Join(tmpDir, "pom.xml"))
+	if err != nil {
+		t.Fatalf("ParsePom() error: %v", err)
+	}
+	if project.Properties == nil || project.Properties.Entries["netty.version"] != "4.1.133.Final" {
+		t.Errorf("netty.version = %q, want 4.1.133.Final (downgrade must be skipped)",
+			project.Properties.Entries["netty.version"])
+	}
+}
+
+func TestMaven_Update_AllowsUpgrade(t *testing.T) {
+	tmpDir := t.TempDir()
+	writeFile(t, filepath.Join(tmpDir, "pom.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>test-project</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-codec-http</artifactId>
+      <version>4.1.110.Final</version>
+    </dependency>
+  </dependencies>
+</project>`)
+	m := &Maven{}
+	cfg := &languages.UpdateConfig{
+		RootDir: tmpDir,
+		Dependencies: []languages.Dependency{
+			{
+				Name:    "io.netty:netty-codec-http",
+				Version: "4.1.133.Final",
+				Metadata: map[string]any{
+					"groupId":    "io.netty",
+					"artifactId": "netty-codec-http",
+				},
+			},
+		},
+	}
+	if err := m.Update(context.Background(), cfg); err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	project, _ := ParsePom(filepath.Join(tmpDir, "pom.xml"))
+	for _, dep := range *project.Dependencies {
+		if dep.GroupID == "io.netty" && dep.ArtifactID == "netty-codec-http" {
+			if dep.Version != "4.1.133.Final" {
+				t.Errorf("version = %q, want 4.1.133.Final", dep.Version)
+			}
+			return
+		}
+	}
+	t.Error("dependency not found")
 }
 
 func TestMaven_Update_ExplicitPropertyConflictErrors(t *testing.T) {
