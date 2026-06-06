@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/chainguard-dev/clog"
@@ -231,6 +232,72 @@ func resolveVersion(version string, properties *gopom.Properties) string {
 	return version
 }
 
+// mavenVersionIsNewer reports whether current is strictly newer than requested,
+// using a simplified Maven version comparison that handles common formats:
+// numeric segments, dot/hyphen separators, and the most common qualifiers
+// (Final, RELEASE, GA, SNAPSHOT, jreN).
+//
+// This function is intentionally conservative: when a segment cannot be parsed
+// as an integer (e.g. an unknown qualifier), it is treated as 0. This ensures
+// we never incorrectly skip a genuine upgrade due to an unrecognised qualifier.
+func mavenVersionIsNewer(current, requested string) bool {
+	if current == "" || requested == "" || current == requested {
+		return false
+	}
+	cs := mavenVersionSegments(current)
+	rs := mavenVersionSegments(requested)
+	for len(cs) < len(rs) {
+		cs = append(cs, 0)
+	}
+	for len(rs) < len(cs) {
+		rs = append(rs, 0)
+	}
+	for i := range cs {
+		if cs[i] > rs[i] {
+			return true
+		}
+		if cs[i] < rs[i] {
+			return false
+		}
+	}
+	return false // equal
+}
+
+// mavenVersionSegments splits a Maven version string into integer segments.
+// Pre-processing: strips .Final/-Final, .RELEASE/-RELEASE, .GA/-GA, -SNAPSHOT,
+// and .jreN/-jreN classifier suffixes, then splits on "." and "-".
+// Non-numeric parts become 0 (conservative).
+func mavenVersionSegments(v string) []int {
+	for _, suffix := range []string{
+		".Final", "-Final",
+		".RELEASE", "-RELEASE",
+		".GA", "-GA",
+		"-SNAPSHOT",
+	} {
+		if strings.HasSuffix(v, suffix) {
+			v = v[:len(v)-len(suffix)]
+			break
+		}
+	}
+	if idx := strings.LastIndexAny(v, ".-"); idx >= 0 {
+		tail := v[idx+1:]
+		if strings.HasPrefix(strings.ToLower(tail), "jre") {
+			v = v[:idx]
+		}
+	}
+	var segments []int
+	for _, part := range strings.FieldsFunc(v, func(r rune) bool {
+		return r == '.' || r == '-'
+	}) {
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			n = 0
+		}
+		segments = append(segments, n)
+	}
+	return segments
+}
+
 // PatchProject updates a gopom.Project with the given patches and properties.
 // applyPatchesToDeps applies patches to a dep slice in place, removing matched
 // entries from missingDeps. A nil deps slice is a no-op.
@@ -267,6 +334,13 @@ func applyPatchesToDeps(ctx context.Context, deps *[]gopom.Dependency, patches [
 			if patch.Version == "" {
 				clog.InfoContextf(ctx, "Found %s:%s — patch has no version, preserving existing version %s",
 					patch.GroupID, patch.ArtifactID, dep.Version)
+				delete(missingDeps, patch)
+				continue
+			}
+			// Skip if this would be a downgrade
+			if mavenVersionIsNewer(dep.Version, patch.Version) {
+				clog.WarnContextf(ctx, "Package %s:%s: current version %s is newer than requested %s, skipping",
+					patch.GroupID, patch.ArtifactID, dep.Version, patch.Version)
 				delete(missingDeps, patch)
 				continue
 			}
@@ -339,6 +413,11 @@ func PatchProject(ctx context.Context, project *gopom.Project, patches []Patch, 
 	for k, v := range propertyPatches {
 		val, exists := project.Properties.Entries[k]
 		if exists {
+			if mavenVersionIsNewer(val, v) {
+				clog.WarnContextf(ctx, "Property %s: current value %s is newer than requested %s, skipping",
+					k, val, v)
+				continue
+			}
 			clog.InfoContextf(ctx, "Updating property: %s from %s to %s", k, val, v)
 			project.Properties.Entries[k] = v
 		}
