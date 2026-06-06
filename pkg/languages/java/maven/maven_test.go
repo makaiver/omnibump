@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1475,6 +1477,116 @@ func TestResolveBOMVersion(t *testing.T) {
 			t.Fatalf("resolveBOMVersion() = %q, want empty", got)
 		}
 	})
+}
+
+func TestResolveBOMVersion_RemoteFallback_Success(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/com/example/test-bom/1.0.0/test-bom-1.0.0.pom" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>test-bom</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.opentelemetry</groupId>
+        <artifactId>opentelemetry-api</artifactId>
+        <version>1.57.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>`))
+	}))
+	defer server.Close()
+
+	t.Setenv("M2_REPO", t.TempDir())
+	t.Setenv("MAVEN_REPO_URL", server.URL)
+
+	deps := []gopom.Dependency{{
+		GroupID:    "com.example",
+		ArtifactID: "test-bom",
+		Version:    "1.0.0",
+		Type:       "pom",
+		Scope:      "import",
+	}}
+	project := &gopom.Project{
+		DependencyManagement: &gopom.DependencyManagement{Dependencies: &deps},
+	}
+
+	got, err := resolveBOMVersion(ctx, project, "io.opentelemetry", "opentelemetry-api")
+	if err != nil {
+		t.Fatalf("resolveBOMVersion() error = %v", err)
+	}
+	if got != "1.57.0" {
+		t.Fatalf("resolveBOMVersion() = %q, want 1.57.0", got)
+	}
+}
+
+func TestResolveBOMVersion_RemoteFallback_NotFound(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	t.Setenv("M2_REPO", t.TempDir())
+	t.Setenv("MAVEN_REPO_URL", server.URL)
+
+	deps := []gopom.Dependency{{
+		GroupID:    "com.example",
+		ArtifactID: "test-bom",
+		Version:    "1.0.0",
+		Type:       "pom",
+		Scope:      "import",
+	}}
+	project := &gopom.Project{
+		DependencyManagement: &gopom.DependencyManagement{Dependencies: &deps},
+	}
+
+	got, err := resolveBOMVersion(ctx, project, "io.opentelemetry", "opentelemetry-api")
+	if err != nil {
+		t.Fatalf("resolveBOMVersion() error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("resolveBOMVersion() = %q, want empty", got)
+	}
+}
+
+func TestResolveBOMVersion_RemoteFallback_ServerError(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	t.Setenv("M2_REPO", t.TempDir())
+	t.Setenv("MAVEN_REPO_URL", server.URL)
+
+	deps := []gopom.Dependency{{
+		GroupID:    "com.example",
+		ArtifactID: "test-bom",
+		Version:    "1.0.0",
+		Type:       "pom",
+		Scope:      "import",
+	}}
+	project := &gopom.Project{
+		DependencyManagement: &gopom.DependencyManagement{Dependencies: &deps},
+	}
+
+	got, err := resolveBOMVersion(ctx, project, "io.opentelemetry", "opentelemetry-api")
+	if err != nil {
+		t.Fatalf("resolveBOMVersion() error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("resolveBOMVersion() = %q, want empty", got)
+	}
 }
 
 func TestMaven_Update_SkipsBOMDowngrade(t *testing.T) {

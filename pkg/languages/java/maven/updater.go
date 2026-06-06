@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/chainguard-dev/clog"
 	"github.com/chainguard-dev/gopom"
@@ -318,6 +320,13 @@ func resolveBOMVersion(ctx context.Context, project *gopom.Project, groupID, art
 		m2repo = filepath.Join(home, ".m2", "repository")
 	}
 
+	mavenRepoURL := os.Getenv("MAVEN_REPO_URL")
+	if mavenRepoURL == "" {
+		mavenRepoURL = "https://repo1.maven.org/maven2"
+	}
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	bomProjectCache := make(map[string]*gopom.Project)
+
 	for _, dep := range *project.DependencyManagement.Dependencies {
 		if dep.Type != "pom" || dep.Scope != "import" {
 			continue
@@ -333,13 +342,8 @@ func resolveBOMVersion(ctx context.Context, project *gopom.Project, groupID, art
 			continue
 		}
 
-		groupPath := strings.ReplaceAll(bomGroupID, ".", string(filepath.Separator))
-		bomPomPath := filepath.Join(m2repo, groupPath, bomArtifactID, bomVersion, bomArtifactID+"-"+bomVersion+".pom")
-
-		bomProject, err := ParsePom(bomPomPath)
-		if err != nil {
-			clog.DebugContextf(ctx, "BOM %s:%s:%s not found in local Maven cache (%s), skipping BOM check",
-				bomGroupID, bomArtifactID, bomVersion, bomPomPath)
+		bomProject := fetchBOMProject(ctx, httpClient, m2repo, mavenRepoURL, bomGroupID, bomArtifactID, bomVersion, bomProjectCache)
+		if bomProject == nil {
 			continue
 		}
 
@@ -366,6 +370,82 @@ func resolveBOMVersion(ctx context.Context, project *gopom.Project, groupID, art
 	}
 
 	return "", nil
+}
+
+func fetchBOMProject(
+	ctx context.Context,
+	httpClient *http.Client,
+	m2repo, mavenRepoURL, bomGroupID, bomArtifactID, bomVersion string,
+	cache map[string]*gopom.Project,
+) *gopom.Project {
+	cacheKey := bomGroupID + ":" + bomArtifactID + ":" + bomVersion
+	if project, ok := cache[cacheKey]; ok {
+		return project
+	}
+
+	localGroupPath := strings.ReplaceAll(bomGroupID, ".", string(filepath.Separator))
+	bomPomPath := filepath.Join(m2repo, localGroupPath, bomArtifactID, bomVersion, bomArtifactID+"-"+bomVersion+".pom")
+	bomProject, err := ParsePom(bomPomPath)
+	if err == nil {
+		cache[cacheKey] = bomProject
+		return bomProject
+	}
+
+	clog.DebugContextf(ctx, "BOM %s:%s:%s not found in local Maven cache (%s), trying remote repository: %v",
+		bomGroupID, bomArtifactID, bomVersion, bomPomPath, err)
+
+	remoteGroupPath := strings.ReplaceAll(bomGroupID, ".", "/")
+	remotePomURL := strings.TrimRight(mavenRepoURL, "/") + "/" + remoteGroupPath + "/" + bomArtifactID + "/" + bomVersion + "/" + bomArtifactID + "-" + bomVersion + ".pom"
+	resp, err := httpClient.Get(remotePomURL)
+	if err != nil {
+		clog.DebugContextf(ctx, "Failed to fetch BOM %s:%s:%s from %s: %v",
+			bomGroupID, bomArtifactID, bomVersion, remotePomURL, err)
+		cache[cacheKey] = nil
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		clog.DebugContextf(ctx, "BOM %s:%s:%s not available from %s: HTTP %d",
+			bomGroupID, bomArtifactID, bomVersion, remotePomURL, resp.StatusCode)
+		cache[cacheKey] = nil
+		return nil
+	}
+
+	tempFile, err := os.CreateTemp("", "omnibump-bom-*.pom")
+	if err != nil {
+		clog.DebugContextf(ctx, "Failed to create temp file for BOM %s:%s:%s from %s: %v",
+			bomGroupID, bomArtifactID, bomVersion, remotePomURL, err)
+		cache[cacheKey] = nil
+		return nil
+	}
+	tempFilePath := tempFile.Name()
+	defer func() { _ = os.Remove(tempFilePath) }()
+
+	if _, err := io.Copy(tempFile, resp.Body); err != nil {
+		_ = tempFile.Close()
+		clog.DebugContextf(ctx, "Failed to write temp file for BOM %s:%s:%s from %s: %v",
+			bomGroupID, bomArtifactID, bomVersion, remotePomURL, err)
+		cache[cacheKey] = nil
+		return nil
+	}
+	if err := tempFile.Close(); err != nil {
+		clog.DebugContextf(ctx, "Failed to close temp file for BOM %s:%s:%s from %s: %v",
+			bomGroupID, bomArtifactID, bomVersion, remotePomURL, err)
+		cache[cacheKey] = nil
+		return nil
+	}
+
+	bomProject, err = ParsePom(tempFilePath)
+	if err != nil {
+		clog.DebugContextf(ctx, "Failed to parse fetched BOM %s:%s:%s from %s: %v",
+			bomGroupID, bomArtifactID, bomVersion, remotePomURL, err)
+		cache[cacheKey] = nil
+		return nil
+	}
+
+	cache[cacheKey] = bomProject
+	return bomProject
 }
 
 // PatchProject updates a gopom.Project with the given patches and properties.
