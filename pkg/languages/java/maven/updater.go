@@ -68,6 +68,9 @@ type Patch struct {
 	Version    string `json:"version" yaml:"version"`
 	Scope      string `json:"scope,omitempty" yaml:"scope,omitempty"`
 	Type       string `json:"type,omitempty" yaml:"type,omitempty"`
+	// Classifier matches only dependencies with the exact same classifier value.
+	// An empty Classifier matches only dependencies with no classifier.
+	Classifier string `json:"classifier,omitempty" yaml:"classifier,omitempty"`
 }
 
 // PatchList represents a list of patches from a YAML file.
@@ -91,6 +94,15 @@ type pomPropertyUpdate struct {
 	pomFile       string
 	propertyName  string
 	propertyValue string
+}
+
+// patchDisplayName returns a human-readable identifier for a patch, including
+// the classifier when present: "groupId:artifactId" or "groupId:artifactId (classifier c)".
+func patchDisplayName(p Patch) string {
+	if p.Classifier != "" {
+		return fmt.Sprintf("%s:%s (classifier %s)", p.GroupID, p.ArtifactID, p.Classifier)
+	}
+	return fmt.Sprintf("%s:%s", p.GroupID, p.ArtifactID)
 }
 
 // dependencyPropertyUpdates moves property-backed dependency patches onto the
@@ -130,9 +142,9 @@ func dependencyPropertyUpdates(ctx context.Context, pomPath string, patches []Pa
 			}
 			propertyName := strings.TrimSuffix(strings.TrimPrefix(dep.Version, "${"), "}")
 			for _, patch := range patches {
-				// Only dependency patches matching this exact dependency can move
-				// from a direct version change to a property update.
-				if dep.ArtifactID != patch.ArtifactID || dep.GroupID != patch.GroupID {
+				// Only dependency patches matching this exact dependency (including
+				// classifier) can move from a direct version change to a property update.
+				if dep.ArtifactID != patch.ArtifactID || dep.GroupID != patch.GroupID || dep.Classifier != patch.Classifier {
 					continue
 				}
 				// This patch is handled by updating the referenced property.
@@ -140,8 +152,8 @@ func dependencyPropertyUpdates(ctx context.Context, pomPath string, patches []Pa
 				// Explicit property updates are appended by Maven.Update below.
 				if explicitValue, explicit := explicitProperties[propertyName]; explicit {
 					if patch.Version != "" && explicitValue != patch.Version {
-						return nil, nil, fmt.Errorf("%w: dependency %s:%s requests %s but property %s is explicitly set to %s",
-							ErrVersionConflict, patch.GroupID, patch.ArtifactID, patch.Version, propertyName, explicitValue)
+						return nil, nil, fmt.Errorf("%w: dependency %s requests %s but property %s is explicitly set to %s",
+							ErrVersionConflict, patchDisplayName(patch), patch.Version, propertyName, explicitValue)
 					}
 					continue
 				}
@@ -150,16 +162,16 @@ func dependencyPropertyUpdates(ctx context.Context, pomPath string, patches []Pa
 						return nil, nil, fmt.Errorf("%w: dependencies using property %s request both %s and %s",
 							ErrVersionConflict, propertyName, propertyValue, patch.Version)
 					}
-					clog.InfoContextf(ctx, "Patching %s:%s via property %s to %s (property already updated)",
-						patch.GroupID, patch.ArtifactID, dep.Version, propertyValue)
+					clog.InfoContextf(ctx, "Patching %s via property %s to %s (property already updated)",
+						patchDisplayName(patch), dep.Version, propertyValue)
 					continue
 				}
 
 				// project.version is a Maven built-in that mirrors the project's own <version>
 				// tag; skip with an informational message instead of failing.
 				if propertyName == "project.version" {
-					clog.InfoContextf(ctx, "Skipping %s:%s: uses ${project.version} which is the project's own version tag, not a configurable property",
-						patch.GroupID, patch.ArtifactID)
+					clog.InfoContextf(ctx, "Skipping %s: uses ${project.version} which is the project's own version tag, not a configurable property",
+						patchDisplayName(patch))
 					continue
 				}
 
@@ -168,8 +180,8 @@ func dependencyPropertyUpdates(ctx context.Context, pomPath string, patches []Pa
 				if err != nil {
 					return nil, nil, fmt.Errorf("failed to resolve file where property %s is set: %w", propertyName, err)
 				}
-				clog.InfoContextf(ctx, "Patching %s:%s via property %s in %s to %s",
-					patch.GroupID, patch.ArtifactID, dep.Version, propertyPomPath, patch.Version)
+				clog.InfoContextf(ctx, "Patching %s via property %s in %s to %s",
+					patchDisplayName(patch), dep.Version, propertyPomPath, patch.Version)
 				propertyValues[propertyName] = patch.Version
 				propertyUpdates = append(propertyUpdates, pomPropertyUpdate{
 					pomFile:       propertyPomPath,
@@ -512,18 +524,18 @@ func applyPatchesToDeps(ctx context.Context, deps *[]gopom.Dependency, patches [
 	for i, dep := range *deps {
 		clog.DebugContextf(ctx, "Checking dependency: %s:%s @ %s", dep.GroupID, dep.ArtifactID, dep.Version)
 		for _, patch := range patches {
-			if dep.ArtifactID != patch.ArtifactID || dep.GroupID != patch.GroupID {
+			if dep.ArtifactID != patch.ArtifactID || dep.GroupID != patch.GroupID || dep.Classifier != patch.Classifier {
 				continue
 			}
 			if isPropertyReference(dep.Version) {
 				propName := strings.TrimSuffix(strings.TrimPrefix(dep.Version, "${"), "}")
 				if _, alreadySet := propertyPatches[propName]; !alreadySet {
-					clog.InfoContextf(ctx, "Patching %s:%s via property %s to %s",
-						patch.GroupID, patch.ArtifactID, dep.Version, patch.Version)
+					clog.InfoContextf(ctx, "Patching %s via property %s to %s",
+						patchDisplayName(patch), dep.Version, patch.Version)
 					propertyPatches[propName] = patch.Version
 				} else {
-					clog.InfoContextf(ctx, "Patching %s:%s via property %s to %s (property already updated)",
-						patch.GroupID, patch.ArtifactID, dep.Version, propertyPatches[propName])
+					clog.InfoContextf(ctx, "Patching %s via property %s to %s (property already updated)",
+						patchDisplayName(patch), dep.Version, propertyPatches[propName])
 				}
 				delete(missingDeps, patch)
 				continue
@@ -531,20 +543,20 @@ func applyPatchesToDeps(ctx context.Context, deps *[]gopom.Dependency, patches [
 			// A patch with no version is a scope-only entry (e.g. scope: provided
 			// to suppress a relocated artifact). Don't overwrite the existing version.
 			if patch.Version == "" {
-				clog.InfoContextf(ctx, "Found %s:%s — patch has no version, preserving existing version %s",
-					patch.GroupID, patch.ArtifactID, dep.Version)
+				clog.InfoContextf(ctx, "Found %s — patch has no version, preserving existing version %s",
+					patchDisplayName(patch), dep.Version)
 				delete(missingDeps, patch)
 				continue
 			}
 			// Skip if this would be a downgrade
 			if mavenVersionIsNewer(dep.Version, patch.Version) {
-				clog.WarnContextf(ctx, "Package %s:%s: current version %s is newer than requested %s, skipping",
-					patch.GroupID, patch.ArtifactID, dep.Version, patch.Version)
+				clog.WarnContextf(ctx, "Package %s: current version %s is newer than requested %s, skipping",
+					patchDisplayName(patch), dep.Version, patch.Version)
 				delete(missingDeps, patch)
 				continue
 			}
-			clog.InfoContextf(ctx, "Patching %s:%s from %s to %s (scope: %s)",
-				patch.GroupID, patch.ArtifactID, dep.Version, patch.Version, patch.Scope)
+			clog.InfoContextf(ctx, "Patching %s from %s to %s (scope: %s)",
+				patchDisplayName(patch), dep.Version, patch.Version, patch.Scope)
 			if (*deps)[i].Version != patch.Version {
 				(*deps)[i].Version = patch.Version
 				changed = true
@@ -571,7 +583,7 @@ func PatchProject(ctx context.Context, project *gopom.Project, patches []Patch, 
 	// Track dependencies that weren't found (will be added to DependencyManagement)
 	missingDeps := make(map[Patch]Patch)
 	for _, p := range patches {
-		clog.InfoContextf(ctx, "Processing patch: %s:%s @ %s", p.GroupID, p.ArtifactID, p.Version)
+		clog.InfoContextf(ctx, "Processing patch: %s @ %s", patchDisplayName(p), p.Version)
 		missingDeps[p] = p
 	}
 
@@ -610,13 +622,14 @@ func PatchProject(ctx context.Context, project *gopom.Project, patches []Patch, 
 				}
 			}
 
-			clog.InfoContextf(ctx, "Adding missing dependency: %s:%s @ %s", md.GroupID, md.ArtifactID, md.Version)
+			clog.InfoContextf(ctx, "Adding missing dependency: %s @ %s", patchDisplayName(md), md.Version)
 			*project.DependencyManagement.Dependencies = append(*project.DependencyManagement.Dependencies, gopom.Dependency{
 				GroupID:    md.GroupID,
 				ArtifactID: md.ArtifactID,
 				Version:    md.Version,
 				Scope:      md.Scope,
 				Type:       md.Type,
+				Classifier: md.Classifier,
 			})
 			changed = true
 		}
@@ -909,7 +922,11 @@ func parsePatches(ctx context.Context, patchFile, patchFlag string) ([]Patch, er
 		if len(parts) >= 5 {
 			depType = parts[4]
 		}
-		patches = append(patches, Patch{GroupID: parts[0], ArtifactID: parts[1], Version: parts[2], Scope: scope, Type: depType})
+		classifier := ""
+		if len(parts) >= 6 {
+			classifier = parts[5]
+		}
+		patches = append(patches, Patch{GroupID: parts[0], ArtifactID: parts[1], Version: parts[2], Scope: scope, Type: depType, Classifier: classifier})
 	}
 	return patches, nil
 }
