@@ -87,6 +87,7 @@ type Package struct {
 	ArtifactID string `json:"artifactId,omitempty" yaml:"artifactId,omitempty"`
 	Scope      string `json:"scope,omitempty" yaml:"scope,omitempty"`
 	Type       string `json:"type,omitempty" yaml:"type,omitempty"`
+	Classifier string `json:"classifier,omitempty" yaml:"classifier,omitempty"`
 }
 
 // Property represents a build property to update.
@@ -331,6 +332,9 @@ func (c *Config) ToUpdateConfig() *languages.UpdateConfig {
 		if pkg.ArtifactID != "" {
 			dep.Metadata["artifactId"] = pkg.ArtifactID
 		}
+		if pkg.Classifier != "" {
+			dep.Metadata["classifier"] = pkg.Classifier
+		}
 		if pkg.Reason != "" {
 			dep.Metadata["reason"] = pkg.Reason
 		}
@@ -431,6 +435,16 @@ func ParseInlinePackages(packagesStr string) ([]Package, error) {
 				Version:    parts[2],
 				Scope:      parts[3],
 				Type:       parts[4],
+			})
+		case 6:
+			// Maven with scope, type and classifier: groupId@artifactId@version@scope@type@classifier
+			packages = append(packages, Package{
+				GroupID:    parts[0],
+				ArtifactID: parts[1],
+				Version:    parts[2],
+				Scope:      parts[3],
+				Type:       parts[4],
+				Classifier: parts[5],
 			})
 		default:
 			return nil, fmt.Errorf("%w: %s (expected name@version, groupId@artifactId@version, or selector=version)", ErrInvalidPackageFormat, pkgStr)

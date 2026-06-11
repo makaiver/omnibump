@@ -223,6 +223,11 @@ func TestParseInlinePackages(t *testing.T) {
 			input: "io.netty@netty-codec-http@4.1.94.Final",
 			want:  []Package{{GroupID: "io.netty", ArtifactID: "netty-codec-http", Version: "4.1.94.Final"}},
 		},
+		{
+			name:  "maven coordinates with classifier",
+			input: "io.netty@netty-transport-native-epoll@4.1.133.Final@compile@jar@linux-x86_64",
+			want:  []Package{{GroupID: "io.netty", ArtifactID: "netty-transport-native-epoll", Version: "4.1.133.Final", Scope: "compile", Type: "jar", Classifier: "linux-x86_64"}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -253,5 +258,58 @@ func TestParseInlinePackages_RejectsMalformed(t *testing.T) {
 				t.Errorf("expected error for %q, got nil", tt.input)
 			}
 		})
+	}
+}
+
+// TestConfig_ToUpdateConfig_Classifier verifies that the Classifier field in
+// Package is propagated to dep.Metadata["classifier"] by ToUpdateConfig.
+func TestConfig_ToUpdateConfig_Classifier(t *testing.T) {
+	cfg := &Config{
+		Packages: []Package{
+			{
+				GroupID:    "io.netty",
+				ArtifactID: "netty-transport-native-epoll",
+				Version:    "4.1.133.Final",
+				Scope:      "compile",
+				Type:       "jar",
+				Classifier: "linux-x86_64",
+			},
+		},
+	}
+
+	uc := cfg.ToUpdateConfig()
+	if len(uc.Dependencies) != 1 {
+		t.Fatalf("ToUpdateConfig() returned %d dependencies, want 1", len(uc.Dependencies))
+	}
+
+	dep := uc.Dependencies[0]
+	classifier, ok := dep.Metadata["classifier"].(string)
+	if !ok {
+		t.Fatal("dep.Metadata[\"classifier\"] not set or not a string")
+	}
+	if classifier != "linux-x86_64" {
+		t.Errorf("dep.Metadata[\"classifier\"] = %q, want linux-x86_64", classifier)
+	}
+}
+
+// TestConfig_ClassifierYAMLRoundtrip verifies that the classifier field
+// is preserved when parsing a deps.yaml containing classifier entries.
+func TestConfig_ClassifierYAMLRoundtrip(t *testing.T) {
+	yamlInput := `packages:
+  - groupId: io.netty
+    artifactId: netty-transport-native-epoll
+    version: 4.1.133.Final
+    scope: compile
+    classifier: linux-x86_64
+`
+	cfg, err := loadDepsFile([]byte(yamlInput))
+	if err != nil {
+		t.Fatalf("loadDepsFile() unexpected error: %v", err)
+	}
+	if len(cfg.Packages) != 1 {
+		t.Fatalf("loadDepsFile() returned %d packages, want 1", len(cfg.Packages))
+	}
+	if cfg.Packages[0].Classifier != "linux-x86_64" {
+		t.Errorf("Package.Classifier = %q, want linux-x86_64", cfg.Packages[0].Classifier)
 	}
 }

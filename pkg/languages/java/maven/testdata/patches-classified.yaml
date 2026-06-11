@@ -1,0 +1,14 @@
+# Copyright 2026 Chainguard, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+patches:
+  - groupId: io.netty
+    artifactId: netty-transport-native-epoll
+    version: 4.1.133.Final
+    scope: compile
+    classifier: linux-x86_64
+  - groupId: io.netty
+    artifactId: netty-transport-native-epoll
+    version: 4.1.133.Final
+    scope: compile
+    classifier: linux-aarch_64

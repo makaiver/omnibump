@@ -312,12 +312,14 @@ func (m *Maven) Validate(ctx context.Context, cfg *languages.UpdateConfig) error
 			// Maven format: groupID:artifactID
 			searchKey = fmt.Sprintf("%s:%s", extractGroupID(dep), extractArtifactID(dep))
 		}
+		// Extract classifier from metadata for exact matching
+		depClassifier, _ := dep.Metadata["classifier"].(string)
 
 		// Check in dependencies
 		if project.Dependencies != nil {
 			for _, pomDep := range *project.Dependencies {
 				key := fmt.Sprintf("%s:%s", pomDep.GroupID, pomDep.ArtifactID)
-				if key == searchKey && resolveVersion(pomDep.Version, properties) == dep.Version {
+				if key == searchKey && pomDep.Classifier == depClassifier && resolveVersion(pomDep.Version, properties) == dep.Version {
 					found = true
 					break
 				}
@@ -328,7 +330,7 @@ func (m *Maven) Validate(ctx context.Context, cfg *languages.UpdateConfig) error
 		if !found && project.DependencyManagement != nil && project.DependencyManagement.Dependencies != nil {
 			for _, pomDep := range *project.DependencyManagement.Dependencies {
 				key := fmt.Sprintf("%s:%s", pomDep.GroupID, pomDep.ArtifactID)
-				if key == searchKey && resolveVersion(pomDep.Version, properties) == dep.Version {
+				if key == searchKey && pomDep.Classifier == depClassifier && resolveVersion(pomDep.Version, properties) == dep.Version {
 					found = true
 					break
 				}
@@ -336,6 +338,9 @@ func (m *Maven) Validate(ctx context.Context, cfg *languages.UpdateConfig) error
 		}
 
 		if !found && dep.Version != "" {
+			// BOM-version lookups match by group:artifact only; classified artifacts
+			// share their base artifact's version, so using GA version for downgrade
+			// checks is acceptable when classifier is non-empty.
 			bomVersion, err := resolveBOMVersion(ctx, project, extractGroupID(dep), extractArtifactID(dep))
 			if err == nil && bomVersion != "" && !mavenVersionIsNewer(dep.Version, bomVersion) {
 				clog.DebugContextf(ctx, "Dependency %s not explicitly set: covered by BOM at %s (requested %s)", searchKey, bomVersion, dep.Version)
@@ -441,6 +446,11 @@ func convertDependenciesToPatches(deps []languages.Dependency) ([]Patch, error) 
 			}
 		}
 
+		// Read classifier from metadata
+		if classifier, ok := dep.Metadata["classifier"].(string); ok {
+			patch.Classifier = classifier
+		}
+
 		// Set defaults if not specified
 		if patch.Scope == "" {
 			patch.Scope = "import"
@@ -456,10 +466,13 @@ func convertDependenciesToPatches(deps []languages.Dependency) ([]Patch, error) 
 		}
 
 		if patch.Version != "" {
-			depKey := fmt.Sprintf("%s:%s", patch.GroupID, patch.ArtifactID)
+			// Include classifier in conflict-detection key so two entries with
+			// the same group:artifact but different classifiers are not treated
+			// as conflicting.
+			depKey := fmt.Sprintf("%s:%s:%s", patch.GroupID, patch.ArtifactID, patch.Classifier)
 			if requestedVersion, exists := requestedVersions[depKey]; exists && requestedVersion != patch.Version {
-				return nil, fmt.Errorf("%w: dependency %s requests both %s and %s",
-					ErrVersionConflict, depKey, requestedVersion, patch.Version)
+				return nil, fmt.Errorf("%w: dependency %s:%s requests both %s and %s",
+					ErrVersionConflict, patch.GroupID, patch.ArtifactID, requestedVersion, patch.Version)
 			}
 			requestedVersions[depKey] = patch.Version
 		}

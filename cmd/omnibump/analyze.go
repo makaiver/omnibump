@@ -340,6 +340,9 @@ func convertPackagesToAnalyzerDeps(packages []config.Package) []analyzer.Depende
 			// For Maven, the name is groupId:artifactId
 			dep.Name = fmt.Sprintf("%s:%s", pkg.GroupID, pkg.ArtifactID)
 		}
+		if pkg.Classifier != "" {
+			dep.Metadata["classifier"] = pkg.Classifier
+		}
 
 		deps = append(deps, dep)
 	}
@@ -362,6 +365,9 @@ func writeDirectUpdatesFile(filename string, deps []analyzer.Dependency) error {
 		}
 		if artifactID, ok := dep.Metadata["artifactId"].(string); ok {
 			pkg.ArtifactID = artifactID
+		}
+		if classifier, ok := dep.Metadata["classifier"].(string); ok {
+			pkg.Classifier = classifier
 		}
 
 		packages = append(packages, pkg)

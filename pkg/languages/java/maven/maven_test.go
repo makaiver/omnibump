@@ -43,17 +43,17 @@ func TestSimplePoms(t *testing.T) {
 	}{{
 		name:    "simple dependency, bumped inline, type and scope unmodified",
 		in:      &gopom.Project{Dependencies: &[]gopom.Dependency{makeDep("a1", "b1", "1.0.0", "import", "jar")}},
-		patches: []Patch{{"a1", "b1", "1.0.1", "INVALID_SCOPE", "INVALID_TYPE"}},
+		patches: []Patch{{"a1", "b1", "1.0.1", "INVALID_SCOPE", "INVALID_TYPE", ""}},
 		want:    &gopom.Project{Dependencies: &[]gopom.Dependency{makeDep("a1", "b1", "1.0.1", "import", "jar")}},
 	}, {
 		name:    "simple dependencymanagement, bumped inline, type and scope unmodified",
 		in:      &gopom.Project{DependencyManagement: &gopom.DependencyManagement{Dependencies: &[]gopom.Dependency{makeDep("a2", "b2", "2.0.0", "compile", "pom")}}},
-		patches: []Patch{{"a2", "b2", "2.0.1", "INVALID_SCOPE", "INVALID_TYPE"}},
+		patches: []Patch{{"a2", "b2", "2.0.1", "INVALID_SCOPE", "INVALID_TYPE", ""}},
 		want:    &gopom.Project{DependencyManagement: &gopom.DependencyManagement{Dependencies: &[]gopom.Dependency{makeDep("a2", "b2", "2.0.1", "compile", "pom")}}},
 	}, {
 		name:    "dependencymanagement, added to dependency management",
 		in:      &gopom.Project{DependencyManagement: &gopom.DependencyManagement{Dependencies: &[]gopom.Dependency{makeDep("other", "b3", "2.0.0")}}},
-		patches: []Patch{{"added", "b", "2.0.1", "import", "somethingelse"}},
+		patches: []Patch{{"added", "b", "2.0.1", "import", "somethingelse", ""}},
 		want:    &gopom.Project{DependencyManagement: &gopom.DependencyManagement{Dependencies: &[]gopom.Dependency{makeDep("other", "b3", "2.0.0"), makeDep("added", "b", "2.0.1", "import", "somethingelse")}}},
 	}, {
 		name: "auto-resolve property: dep uses property ref, no --properties passed",
@@ -360,6 +360,18 @@ func TestParsePatches(t *testing.T) {
 			Version:    "v1",
 			Scope:      "import", // default
 			Type:       "jar",    // default
+		}},
+	}, {
+		name:   "flag with classifier",
+		inFile: "",
+		inDeps: "io.netty@netty-transport-native-epoll@4.1.133.Final@compile@jar@linux-x86_64",
+		want: []Patch{{
+			GroupID:    "io.netty",
+			ArtifactID: "netty-transport-native-epoll",
+			Version:    "4.1.133.Final",
+			Scope:      "compile",
+			Type:       "jar",
+			Classifier: "linux-x86_64",
 		}},
 	}}
 	for _, tc := range testCases {
@@ -3065,5 +3077,218 @@ func TestFindMavenPoms(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestParsePatches_Classifier verifies that classifier is parsed from both YAML files and inline flags.
+func TestParsePatches_Classifier(t *testing.T) {
+	t.Run("yaml file with classifier", func(t *testing.T) {
+		got, err := parsePatches(context.Background(), "testdata/patches-classified.yaml", "")
+		if err != nil {
+			t.Fatalf("parsePatches() unexpected error: %v", err)
+		}
+		want := []Patch{
+			{GroupID: "io.netty", ArtifactID: "netty-transport-native-epoll", Version: "4.1.133.Final", Scope: "compile", Type: "jar", Classifier: "linux-x86_64"},
+			{GroupID: "io.netty", ArtifactID: "netty-transport-native-epoll", Version: "4.1.133.Final", Scope: "compile", Type: "jar", Classifier: "linux-aarch_64"},
+		}
+		if diff := cmp.Diff(want, got, cmpopts.SortSlices(lessPatch)); diff != "" {
+			t.Errorf("parsePatches() classifier mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("inline flag with classifier", func(t *testing.T) {
+		got, err := parsePatches(context.Background(), "", "io.netty@netty-transport-native-epoll@4.1.133.Final@compile@jar@linux-x86_64")
+		if err != nil {
+			t.Fatalf("parsePatches() unexpected error: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("parsePatches() returned %d patches, want 1", len(got))
+		}
+		if got[0].Classifier != "linux-x86_64" {
+			t.Errorf("parsePatches() Classifier = %q, want linux-x86_64", got[0].Classifier)
+		}
+	})
+}
+
+// TestPatchProject_ClassifiedDeps verifies that two patches with the same
+// groupId/artifactId but different classifiers are treated as distinct map keys
+// and both get added to dependencyManagement when absent.
+func TestPatchProject_ClassifiedDeps(t *testing.T) {
+	project := &gopom.Project{
+		DependencyManagement: &gopom.DependencyManagement{
+			Dependencies: &[]gopom.Dependency{
+				{GroupID: "com.example", ArtifactID: "other", Version: "1.0.0", Scope: "compile", Type: "jar"},
+			},
+		},
+	}
+
+	patches := []Patch{
+		{GroupID: "io.netty", ArtifactID: "netty-transport-native-epoll", Version: "4.1.133.Final", Scope: "compile", Type: "jar", Classifier: "linux-x86_64"},
+		{GroupID: "io.netty", ArtifactID: "netty-transport-native-epoll", Version: "4.1.133.Final", Scope: "compile", Type: "jar", Classifier: "linux-aarch_64"},
+	}
+
+	updated, changed, err := PatchProject(context.Background(), project, patches, nil)
+	if err != nil {
+		t.Fatalf("PatchProject() unexpected error: %v", err)
+	}
+	if !changed {
+		t.Fatal("PatchProject() changed=false, want true")
+	}
+	if updated.DependencyManagement == nil || updated.DependencyManagement.Dependencies == nil {
+		t.Fatal("DependencyManagement should not be nil")
+	}
+
+	deps := *updated.DependencyManagement.Dependencies
+	// Expect original dep + 2 new classified entries = 3 total
+	if len(deps) != 3 {
+		t.Fatalf("DependencyManagement has %d entries, want 3: %+v", len(deps), deps)
+	}
+
+	x86Found, aarch64Found := false, false
+	for _, dep := range deps {
+		if dep.GroupID == "io.netty" && dep.ArtifactID == "netty-transport-native-epoll" {
+			switch dep.Classifier {
+			case "linux-x86_64":
+				x86Found = true
+				if dep.Version != "4.1.133.Final" {
+					t.Errorf("linux-x86_64 classifier: version = %q, want 4.1.133.Final", dep.Version)
+				}
+			case "linux-aarch_64":
+				aarch64Found = true
+				if dep.Version != "4.1.133.Final" {
+					t.Errorf("linux-aarch_64 classifier: version = %q, want 4.1.133.Final", dep.Version)
+				}
+			}
+		}
+	}
+	if !x86Found {
+		t.Error("linux-x86_64 classified entry was not added to DependencyManagement")
+	}
+	if !aarch64Found {
+		t.Error("linux-aarch_64 classified entry was not added to DependencyManagement")
+	}
+}
+
+// TestPatchProject_ClassifierMatchIsExact verifies that a patch with a classifier
+// only matches the dependency with that exact classifier, not the unclassified one.
+func TestPatchProject_ClassifierMatchIsExact(t *testing.T) {
+	project := &gopom.Project{
+		DependencyManagement: &gopom.DependencyManagement{
+			Dependencies: &[]gopom.Dependency{
+				// Unclassified base artifact
+				{GroupID: "io.netty", ArtifactID: "netty-transport-native-epoll", Version: "4.1.100.Final", Scope: "compile", Type: "jar"},
+				// Classified artifact
+				{GroupID: "io.netty", ArtifactID: "netty-transport-native-epoll", Version: "4.1.100.Final", Scope: "compile", Type: "jar", Classifier: "linux-x86_64"},
+			},
+		},
+	}
+
+	// Patch targets only the linux-x86_64 classified artifact
+	patches := []Patch{
+		{GroupID: "io.netty", ArtifactID: "netty-transport-native-epoll", Version: "4.1.133.Final", Scope: "compile", Type: "jar", Classifier: "linux-x86_64"},
+	}
+
+	updated, changed, err := PatchProject(context.Background(), project, patches, nil)
+	if err != nil {
+		t.Fatalf("PatchProject() unexpected error: %v", err)
+	}
+	if !changed {
+		t.Fatal("PatchProject() changed=false, want true")
+	}
+
+	deps := *updated.DependencyManagement.Dependencies
+	for _, dep := range deps {
+		if dep.GroupID == "io.netty" && dep.ArtifactID == "netty-transport-native-epoll" {
+			if dep.Classifier == "linux-x86_64" {
+				if dep.Version != "4.1.133.Final" {
+					t.Errorf("classified dep version = %q, want 4.1.133.Final", dep.Version)
+				}
+			} else if dep.Classifier == "" {
+				if dep.Version != "4.1.100.Final" {
+					t.Errorf("unclassified dep version = %q, want 4.1.100.Final (must not be patched)", dep.Version)
+				}
+			}
+		}
+	}
+}
+
+// TestConvertDependenciesToPatches_Classifier verifies that the classifier
+// metadata field is propagated to the Patch struct and that two entries with
+// the same group:artifact but different classifiers are NOT treated as conflicts.
+func TestConvertDependenciesToPatches_Classifier(t *testing.T) {
+	deps := []languages.Dependency{
+		{
+			Version: "4.1.133.Final",
+			Scope:   "compile",
+			Type:    "jar",
+			Metadata: map[string]any{
+				"groupId":    "io.netty",
+				"artifactId": "netty-transport-native-epoll",
+				"classifier": "linux-x86_64",
+			},
+		},
+		{
+			Version: "4.1.133.Final",
+			Scope:   "compile",
+			Type:    "jar",
+			Metadata: map[string]any{
+				"groupId":    "io.netty",
+				"artifactId": "netty-transport-native-epoll",
+				"classifier": "linux-aarch_64",
+			},
+		},
+	}
+
+	patches, err := convertDependenciesToPatches(deps)
+	if err != nil {
+		t.Fatalf("convertDependenciesToPatches() unexpected error: %v", err)
+	}
+	if len(patches) != 2 {
+		t.Fatalf("convertDependenciesToPatches() returned %d patches, want 2", len(patches))
+	}
+	classifiers := map[string]bool{}
+	for _, p := range patches {
+		classifiers[p.Classifier] = true
+		if p.GroupID != "io.netty" || p.ArtifactID != "netty-transport-native-epoll" {
+			t.Errorf("unexpected patch: %+v", p)
+		}
+	}
+	if !classifiers["linux-x86_64"] {
+		t.Error("linux-x86_64 classifier not found in converted patches")
+	}
+	if !classifiers["linux-aarch_64"] {
+		t.Error("linux-aarch_64 classifier not found in converted patches")
+	}
+}
+
+// TestConvertDependenciesToPatches_SameClassifierConflict verifies that two entries
+// with the same group:artifact:classifier but different versions are rejected.
+func TestConvertDependenciesToPatches_SameClassifierConflict(t *testing.T) {
+	deps := []languages.Dependency{
+		{
+			Version: "4.1.100.Final",
+			Scope:   "compile",
+			Type:    "jar",
+			Metadata: map[string]any{
+				"groupId":    "io.netty",
+				"artifactId": "netty-transport-native-epoll",
+				"classifier": "linux-x86_64",
+			},
+		},
+		{
+			Version: "4.1.133.Final",
+			Scope:   "compile",
+			Type:    "jar",
+			Metadata: map[string]any{
+				"groupId":    "io.netty",
+				"artifactId": "netty-transport-native-epoll",
+				"classifier": "linux-x86_64",
+			},
+		},
+	}
+
+	_, err := convertDependenciesToPatches(deps)
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Errorf("convertDependenciesToPatches() error = %v, want ErrVersionConflict", err)
 	}
 }

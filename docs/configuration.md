@@ -132,6 +132,7 @@ packages:
     version: 1.2.3
     scope: compile      # optional
     type: jar           # optional
+    classifier: ""      # optional; e.g. linux-x86_64 for native artifacts
 ```
 
 **Inline format:**
@@ -139,6 +140,7 @@ packages:
 --packages "groupId@artifactId@version"
 --packages "groupId@artifactId@version@scope"
 --packages "groupId@artifactId@version@scope@type"
+--packages "groupId@artifactId@version@scope@type@classifier"
 ```
 
 **Examples:**
@@ -146,6 +148,7 @@ packages:
 --packages "io.netty@netty-codec-http@4.1.94.Final"
 --packages "junit@junit@4.13.2@test"
 --packages "org.example@custom@1.0.0@compile@war"
+--packages "io.netty@netty-transport-native-epoll@4.1.133.Final@compile@jar@linux-x86_64"
 ```
 
 ### Gradle
