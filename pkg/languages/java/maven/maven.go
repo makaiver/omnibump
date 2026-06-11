@@ -471,8 +471,12 @@ func convertDependenciesToPatches(deps []languages.Dependency) ([]Patch, error) 
 			// as conflicting.
 			depKey := fmt.Sprintf("%s:%s:%s", patch.GroupID, patch.ArtifactID, patch.Classifier)
 			if requestedVersion, exists := requestedVersions[depKey]; exists && requestedVersion != patch.Version {
-				return nil, fmt.Errorf("%w: dependency %s:%s requests both %s and %s",
-					ErrVersionConflict, patch.GroupID, patch.ArtifactID, requestedVersion, patch.Version)
+				displayKey := patch.GroupID + ":" + patch.ArtifactID
+				if patch.Classifier != "" {
+					displayKey += " (classifier " + patch.Classifier + ")"
+				}
+				return nil, fmt.Errorf("%w: dependency %s requests both %s and %s",
+					ErrVersionConflict, displayKey, requestedVersion, patch.Version)
 			}
 			requestedVersions[depKey] = patch.Version
 		}
